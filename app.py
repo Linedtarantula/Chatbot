@@ -16,6 +16,7 @@ WhatsApp flow:
 
 import os
 import time
+import json
 from datetime import datetime, timedelta
 
 from flask import Flask, request, jsonify
@@ -40,8 +41,12 @@ if not DATABASE_URL:
 # Twilio
 TWILIO_ACCOUNT_SID = os.environ.get('TWILIO_ACCOUNT_SID')
 TWILIO_AUTH_TOKEN = os.environ.get('TWILIO_AUTH_TOKEN')
-TWILIO_WHATSAPP_NUMBER = os.environ.get('TWILIO_WHATSAPP_NUMBER', 'whatsapp:+14155238886')
-INSTALLER_PHONE_NUMBER = os.environ.get('INSTALLER_PHONE_NUMBER', '')
+TWILIO_WHATSAPP_NUMBER = os.environ.get('TWILIO_WHATSAPP_NUMBER', 'whatsapp:+34613491811')
+INSTALLER_PHONE_NUMBER = os.environ.get('INSTALLER_PHONE_NUMBER', '+34694288242')
+
+# WhatsApp Template SIDs (approved by Meta)
+TEMPLATE_GREETING = os.environ.get('TEMPLATE_GREETING', 'HX0f24fd9eaf3fd49fc64a5f8e2bcdb9ee')  # reagendar
+TEMPLATE_NEW = os.environ.get('TEMPLATE_NEW', 'HXb9370496f85f7a99f9290f236b91358d')  # cita nueva
 
 app = Flask(__name__)
 app.config['SQLALCHEMY_DATABASE_URI'] = DATABASE_URL
@@ -72,9 +77,10 @@ class ConversationState:
     CANCELLED = 'cancelled'
 
 
-# --- Twilio helper ----------------------------------------------------------
+# --- Twilio helpers ---------------------------------------------------------
 
 def send_whatsapp_message(to_number, message):
+    """Send a free-form WhatsApp message (only works within 24h window)."""
     try:
         if client is None:
             print('Twilio client not configured; message not sent.')
@@ -86,6 +92,31 @@ def send_whatsapp_message(to_number, message):
         return sent.sid
     except Exception as e:
         print(f'Error sending message: {e}')
+        return None
+
+
+def send_whatsapp_template(to_number, template_sid, variables):
+    """Send a template-based WhatsApp message (required for first contact)."""
+    try:
+        if client is None:
+            print('Twilio client not configured; template not sent.')
+            return None
+        if not to_number.startswith('whatsapp:'):
+            to_number = f'whatsapp:{to_number}'
+        sent = client.messages.create(
+            from_=TWILIO_WHATSAPP_NUMBER,
+            to=to_number,
+            content_sid=template_sid,
+            content_variables=json.dumps(variables),
+        )
+        return sent.sid
+    except Exception as e:
+        print(f'Error sending template: {e}')
+        # Fallback: try sending as free-form text
+        fallback_msg = variables.get('fallback_text', '')
+        if fallback_msg:
+            print('Attempting fallback with free-form message...')
+            return send_whatsapp_message(to_number, fallback_msg)
         return None
 
 
@@ -160,14 +191,26 @@ def initiate_appointment():
 
         customer_name = data.get('customer_name', 'cliente')
         work_type = data.get('work_type', 'la instalación')
-        greeting_message = (
-            f"Buenos días, {customer_name}.\n\n"
-            f"Le escribo como instalador de Leroy Merlin. Me pongo en contacto con usted "
-            f"porque, debido al alto volumen de trabajo que tenemos estos días, necesitamos "
-            f"reorganizar la agenda y concretar una nueva fecha para {work_type}.\n\n"
+        message_type = data.get('message_type', 'greeting')  # 'greeting' = reagendar, 'new' = cita nueva
+
+        # Use approved WhatsApp templates for first contact
+        if message_type == 'new':
+            template_sid = TEMPLATE_NEW
+        else:
+            template_sid = TEMPLATE_GREETING
+
+        fallback_text = (
+            f"Buenos días, {customer_name}. Le escribo como instalador de Leroy Merlin "
+            f"para concretar una fecha para {work_type}. "
             f"¿Le parece bien si le propongo algunas fechas disponibles?"
         )
-        message_sid = send_whatsapp_message(customer_phone, greeting_message)
+
+        template_vars = {
+            '1': customer_name,
+            '2': work_type,
+            'fallback_text': fallback_text,
+        }
+        message_sid = send_whatsapp_template(customer_phone, template_sid, template_vars)
 
         if message_sid:
             conversations[customer_phone]['state'] = ConversationState.PROPOSING_SLOTS
