@@ -250,8 +250,8 @@ def _ensure_content_templates():
 
     templates_to_create = {
         'slots_3': {
-            'friendly_name': 'ventura_slots_3opt_v1',
-            'body': '{{1}}',
+            'friendly_name': 'ventura_slots_3opt_v2',
+            'body': 'Seleccione una opción:',
             'actions': [
                 {'title': 'Opción 1', 'id': '1'},
                 {'title': 'Opción 2', 'id': '2'},
@@ -259,32 +259,32 @@ def _ensure_content_templates():
             ]
         },
         'slots_2': {
-            'friendly_name': 'ventura_slots_2opt_v1',
-            'body': '{{1}}',
+            'friendly_name': 'ventura_slots_2opt_v2',
+            'body': 'Seleccione una opción:',
             'actions': [
                 {'title': 'Opción 1', 'id': '1'},
                 {'title': 'Opción 2', 'id': '2'},
             ]
         },
         'slots_1': {
-            'friendly_name': 'ventura_slots_1opt_v1',
-            'body': '{{1}}',
+            'friendly_name': 'ventura_slots_1opt_v2',
+            'body': '¿Le viene bien esta fecha?',
             'actions': [
                 {'title': 'Sí, me viene bien', 'id': '1'},
                 {'title': 'Prefiero otra fecha', 'id': 'no'},
             ]
         },
         'confirm_yesno': {
-            'friendly_name': 'ventura_confirm_yn_v1',
-            'body': '{{1}}',
+            'friendly_name': 'ventura_confirm_yn_v2',
+            'body': '¿Confirma la cita?',
             'actions': [
-                {'title': 'Sí, confirmo ✅', 'id': 'si'},
+                {'title': 'Sí, confirmo', 'id': 'si'},
                 {'title': 'Cambiar algo', 'id': 'no'},
             ]
         },
         'address_check': {
-            'friendly_name': 'ventura_address_v1',
-            'body': '{{1}}',
+            'friendly_name': 'ventura_address_v2',
+            'body': '¿Es correcta la dirección?',
             'actions': [
                 {'title': 'Sí, es correcta', 'id': 'si'},
                 {'title': 'No, es otra', 'id': 'no'},
@@ -326,27 +326,33 @@ def _ensure_content_templates():
 
 def send_whatsapp_buttons(to_number, body_text, template_key):
     """Send a WhatsApp message with quick-reply buttons.
-    Falls back to plain text if buttons are not available."""
+    Sends the detailed text first, then the buttons as a second message.
+    Falls back to plain text only if buttons are not available."""
+    # Always send the detailed text first
+    text_sid = send_whatsapp_message(to_number, body_text)
+
+    # Then try to send buttons as a follow-up
     sids = _ensure_content_templates()
     content_sid = sids.get(template_key)
 
     if not content_sid:
-        return send_whatsapp_message(to_number, body_text)
+        print(f'No content template for {template_key}, text-only sent')
+        return text_sid
 
     try:
-        if not to_number.startswith('whatsapp:'):
-            to_number = f'whatsapp:{to_number}'
+        btn_to = to_number
+        if not btn_to.startswith('whatsapp:'):
+            btn_to = f'whatsapp:{btn_to}'
         sent = client.messages.create(
             from_=TWILIO_WHATSAPP_NUMBER,
-            to=to_number,
+            to=btn_to,
             content_sid=content_sid,
-            content_variables=json.dumps({'1': body_text}),
         )
         print(f'Buttons ({template_key}) sent OK: {sent.sid}')
         return sent.sid
     except Exception as e:
-        print(f'Error sending buttons, falling back to text: {e}')
-        return send_whatsapp_message(to_number, body_text)
+        print(f'Error sending buttons (text already sent): {e}')
+        return text_sid
 
 
 # --- Availability logic (uses panel API) ------------------------------------
@@ -1040,8 +1046,8 @@ def whatsapp_webhook():
                 response.message(
                     f"Estupendo. Su cita ha quedado confirmada. ✅\n\n"
                     f"Le espero el {selected_slot['formatted']}.\n\n"
-                    f'Recibirá un recordatorio el día antes. Si le surgiera cualquier '
-                    f'imprevisto, le agradecería que me avisara con antelación.\n\n'
+                    f'Si le surgiera cualquier imprevisto, le agradecería que me '
+                    f'avisara con antelación.\n\n'
                     f'Muchas gracias por su tiempo. Un saludo.')
                 conversation['state'] = ConversationState.COMPLETED
                 work_type = conversation.get('work_type') or 'Instalación'
