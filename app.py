@@ -309,12 +309,12 @@ def _ensure_content_templates():
             content = client.content.v1.contents.create(
                 friendly_name=tmpl['friendly_name'],
                 language='es',
-                types=json.dumps({
+                types={
                     'twilio/quick-reply': {
                         'body': tmpl['body'],
                         'actions': tmpl['actions'],
                     }
-                }),
+                },
             )
             _content_sids[key] = content.sid
             print(f'Content template "{key}" created: {content.sid}')
@@ -944,14 +944,36 @@ def whatsapp_webhook():
                     f"Revisa la agenda y contacta al cliente directamente."
                 )
             else:
-                slots_msg = _format_slots_message(conversation)
-                hint = (
-                    f"Disculpe, no le he entendido.\n\n{slots_msg}\n\n"
-                    f"Pulse un botón o escriba el número de la opción."
-                )
-                _send_and_log(conversation, customer_phone, hint,
-                              button_key=_get_slots_button_key(len(slots)))
-                return str(MessagingResponse())
+                # Count misunderstandings — after 2 unclear messages, escalate
+                misses = conversation.get('_misunderstand_count', 0) + 1
+                conversation['_misunderstand_count'] = misses
+
+                if misses >= 2:
+                    # Escalate to installer
+                    raw_msg = request.values.get('Body', '').strip()
+                    response.message(
+                        'Disculpe, no consigo entender su respuesta. '
+                        'Le paso con el instalador para que le atienda directamente.')
+                    _notify_installer(
+                        f"⚠️ *Bot no entiende al cliente*\n\n"
+                        f"👤 {conversation.get('customer_name', 'Cliente')}\n"
+                        f"📞 {conversation.get('customer_phone', '')}\n"
+                        f"🔧 {conversation.get('work_type', '')}\n"
+                        f"📍 {conversation.get('location', '')}\n"
+                        f"💬 \"{raw_msg}\"\n\n"
+                        f"El bot no ha podido entender al cliente después de varios intentos. "
+                        f"Aténdelo manualmente."
+                    )
+                    conversation['state'] = ConversationState.NEEDS_MANUAL
+                else:
+                    slots_msg = _format_slots_message(conversation)
+                    hint = (
+                        f"Disculpe, no le he entendido.\n\n{slots_msg}\n\n"
+                        f"Pulse un botón o escriba el número de la opción."
+                    )
+                    _send_and_log(conversation, customer_phone, hint,
+                                  button_key=_get_slots_button_key(len(slots)))
+                    return str(MessagingResponse())
 
         # --- CONFIRMING ADDRESS ---
         elif state == ConversationState.CONFIRMING_ADDRESS:
@@ -1006,6 +1028,7 @@ def whatsapp_webhook():
             is_confirmed = user_choice == 'si' or any(
                 w in user_choice for w in ['si', 'sí', 'vale', 'ok', 'correcto', 'confirmo']
             )
+            is_rejection = user_choice == 'no'
             if is_confirmed:
                 selected_slot = conversation['selected_slot']
                 try:
@@ -1031,12 +1054,52 @@ def whatsapp_webhook():
                     f"📞 {conversation.get('customer_phone', '')}\n\n"
                     f"La cita se ha guardado en tu agenda automáticamente."
                 )
-            elif user_choice == 'no':
-                response.message('Por supuesto. ¿Qué necesita que modifiquemos? Dígame y '
-                                 'lo ajustamos enseguida.')
+            elif is_rejection:
+                response.message(
+                    'Por supuesto. ¿Qué necesita que modifiquemos? Dígame y '
+                    'lo ajustamos enseguida.')
+                # Notify installer that client wants changes
+                _notify_installer(
+                    f"💬 *Cliente quiere cambiar algo de la cita*\n\n"
+                    f"👤 {conversation.get('customer_name', 'Cliente')}\n"
+                    f"📞 {conversation.get('customer_phone', '')}\n"
+                    f"🔧 {conversation.get('work_type', '')}\n"
+                    f"📍 {conversation.get('location', '')}\n\n"
+                    f"El cliente no ha confirmado y quiere hacer cambios."
+                )
+                conversation['state'] = ConversationState.NEEDS_MANUAL
             else:
-                response.message('Por supuesto. ¿Qué necesita que modifiquemos? Dígame y '
-                                 'lo ajustamos enseguida.')
+                # Client said something unexpected (imprevisto, pregunta, etc.)
+                raw_msg = request.values.get('Body', '').strip()
+                response.message(
+                    'Gracias por avisarme. Le paso su mensaje al instalador '
+                    'para que lo gestione lo antes posible.')
+                _notify_installer(
+                    f"💬 *Mensaje del cliente durante confirmación*\n\n"
+                    f"👤 {conversation.get('customer_name', 'Cliente')}\n"
+                    f"📞 {conversation.get('customer_phone', '')}\n"
+                    f"🔧 {conversation.get('work_type', '')}\n"
+                    f"📍 {conversation.get('location', '')}\n"
+                    f"💬 \"{raw_msg}\"\n\n"
+                    f"El cliente ha escrito esto en la fase de confirmación. "
+                    f"Puede ser un imprevisto o una duda. Revísalo."
+                )
+                conversation['state'] = ConversationState.NEEDS_MANUAL
+
+        # --- COMPLETED: client writes after confirmation ---
+        elif state == ConversationState.COMPLETED:
+            raw_msg = request.values.get('Body', '').strip()
+            response.message(
+                'Gracias por su mensaje. Se lo paso al instalador '
+                'para que le atienda lo antes posible.')
+            _notify_installer(
+                f"💬 *Mensaje de cliente con cita confirmada*\n\n"
+                f"👤 {conversation.get('customer_name', 'Cliente')}\n"
+                f"📞 {conversation.get('customer_phone', '')}\n"
+                f"💬 \"{raw_msg}\"\n\n"
+                f"Este cliente ya tiene cita confirmada pero ha escrito de nuevo. "
+                f"Puede ser una cancelación, imprevisto o consulta."
+            )
 
         return str(response)
     except Exception as e:
