@@ -275,13 +275,13 @@ def find_available_slots(duration_hours=DEFAULT_DURATION_HOURS, num_slots=3,
     all_appointments = _fetch_appointments(start_str, end_str)
     all_blocked = _fetch_blocked_days(start_str, end_str)
 
-    # Active statuses
-    active_statuses = {'pending', 'confirmed', 'en_progreso'}
+    # All statuses except 'cancelled' count as occupied
+    cancelled_statuses = {'cancelled', 'cancelada'}
 
-    # Group appointments by date
+    # Group appointments by date (all non-cancelled)
     appts_by_day = {}
     for appt in all_appointments:
-        if appt.get('status', 'pending') in active_statuses:
+        if appt.get('status', 'pending') not in cancelled_statuses:
             appts_by_day.setdefault(appt['date'], []).append(appt)
 
     # Blocked days set
@@ -291,7 +291,7 @@ def find_available_slots(duration_hours=DEFAULT_DURATION_HOURS, num_slots=3,
     zone_days = {}
     if preferred_zone:
         for appt in all_appointments:
-            if appt.get('status', 'pending') in active_statuses:
+            if appt.get('status', 'pending') not in cancelled_statuses:
                 if get_zone_for_location(appt.get('locality', '')) == preferred_zone:
                     zone_days.setdefault(appt['date'], []).append(appt)
 
@@ -408,8 +408,8 @@ def get_day_appointments(target_date):
         day_str = target_date.isoformat()
 
     appointments = _fetch_appointments(day_str, day_str)
-    active_statuses = {'pending', 'confirmed', 'en_progreso'}
-    active = [a for a in appointments if a.get('status', 'pending') in active_statuses]
+    cancelled_statuses = {'cancelled', 'cancelada'}
+    active = [a for a in appointments if a.get('status', 'pending') not in cancelled_statuses]
     active.sort(key=lambda a: a.get('timeStart', '99:99'))
 
     # Enrich with zone info
