@@ -292,13 +292,26 @@ def _ensure_content_templates():
         },
     }
 
-    # Try to find existing templates first
+    # List existing templates
     try:
         existing = client.content.v1.contents.list()
         existing_map = {c.friendly_name: c.sid for c in existing}
     except Exception as e:
         print(f'Could not list content templates: {e}')
         existing_map = {}
+
+    # Auto-cleanup: delete old v1 templates that no longer match
+    old_prefixes = ['ventura_slots_3opt_v1', 'ventura_slots_2opt_v1',
+                    'ventura_slots_1opt_v1', 'ventura_confirm_yn_v1',
+                    'ventura_address_v1']
+    for old_name in old_prefixes:
+        if old_name in existing_map:
+            try:
+                client.content.v1.contents(existing_map[old_name]).delete()
+                print(f'Deleted old template: {old_name} ({existing_map[old_name]})')
+                del existing_map[old_name]
+            except Exception as e:
+                print(f'Could not delete old template {old_name}: {e}')
 
     for key, tmpl in templates_to_create.items():
         if tmpl['friendly_name'] in existing_map:
