@@ -629,6 +629,17 @@ def whatsapp_webhook():
                     f'imprevisto, le agradecería que me avisara con antelación.\n\n'
                     f'Muchas gracias por su tiempo. Un saludo.')
                 conversation['state'] = ConversationState.COMPLETED
+                # Notify installer about the confirmed appointment
+                work_type = conversation.get('work_type') or 'Instalación'
+                _notify_installer(
+                    f"✅ *Cita confirmada*\n\n"
+                    f"👤 {conversation.get('customer_name', 'Cliente')}\n"
+                    f"📅 {selected_slot['formatted']}\n"
+                    f"📍 {conversation.get('location', '')} - {conversation.get('address', '')}\n"
+                    f"🔧 {work_type}\n"
+                    f"📞 {conversation.get('customer_phone', '')}\n\n"
+                    f"La cita se ha guardado en tu agenda automáticamente."
+                )
             else:
                 response.message('Por supuesto. ¿Qué necesita que modifiquemos? Dígame y '
                                  'lo ajustamos enseguida.')
@@ -648,6 +659,71 @@ def get_appointment_status(conversation_id):
         if conv['id'] == conversation_id:
             return jsonify({'success': True, 'state': conv['state']})
     return jsonify({'success': False, 'error': 'Conversation not found'}), 404
+
+
+@app.route('/manual-reply', methods=['POST'])
+def manual_reply():
+    """Installer sends a custom message or new dates to a client.
+    Used via the chatbot when the installer wants to intervene."""
+    try:
+        data = request.json or {}
+        customer_phone = data.get('customer_phone')
+        message = data.get('message', '').strip()
+        new_slots = data.get('new_slots')  # Optional: list of {date, time} dicts
+
+        if not customer_phone:
+            return jsonify({'success': False, 'error': 'customer_phone is required'}), 400
+        if not customer_phone.startswith('+'):
+            customer_phone = f'+34{customer_phone}'
+
+        conversation = conversations.get(customer_phone)
+
+        # If new_slots provided, format them and send as options
+        if new_slots and conversation:
+            from datetime import datetime as dt
+            slots = []
+            for i, s in enumerate(new_slots):
+                slot_date = dt.strptime(s['date'], '%Y-%m-%d')
+                slot_time = s.get('time', '08:00')
+                duration_min = int(conversation.get('duration_hours', 1.5) * 60)
+                end_h, end_m = divmod(_time_to_minutes(slot_time) + duration_min, 60)
+                slot_formatted = f"{format_es(slot_date.replace(hour=int(slot_time.split(':')[0]), minute=int(slot_time.split(':')[1])))} (aprox. hasta las {end_h:02d}:{end_m:02d})"
+                slots.append({
+                    'date': s['date'],
+                    'start_time': slot_time,
+                    'end_time': f"{end_h:02d}:{end_m:02d}",
+                    'formatted': format_es(slot_date.replace(hour=int(slot_time.split(':')[0]), minute=int(slot_time.split(':')[1]))),
+                    'duration_min': duration_min,
+                })
+            conversation['time_slots'] = slots
+            conversation['state'] = ConversationState.WAITING_CHOICE
+
+            lines = []
+            for i, slot in enumerate(slots):
+                lines.append(f"{i + 1}. {slot['formatted']} (aprox. hasta las {slot['end_time']})")
+            msg = (
+                f"Disculpe la espera. He revisado mi agenda y le puedo ofrecer estas otras fechas:\n\n"
+                f"{'\n'.join(lines)}\n\n"
+                f"¿Cuál le viene mejor? Responda con el número de la opción."
+            )
+            message_sid = send_whatsapp_message(customer_phone, msg)
+            if conversation.get('message_log') is not None:
+                conversation['message_log'].append({'from': 'bot', 'text': msg, 'time': datetime.now().strftime('%H:%M')})
+            return jsonify({'success': True, 'message_sid': message_sid, 'action': 'new_slots_sent'})
+
+        # Otherwise send a free-form message
+        if not message:
+            return jsonify({'success': False, 'error': 'message or new_slots is required'}), 400
+
+        message_sid = send_whatsapp_message(customer_phone, message)
+        if conversation and conversation.get('message_log') is not None:
+            conversation['message_log'].append({'from': 'instalador', 'text': message, 'time': datetime.now().strftime('%H:%M')})
+
+        if message_sid:
+            return jsonify({'success': True, 'message_sid': message_sid, 'action': 'message_sent'})
+        return jsonify({'success': False, 'error': 'Failed to send message'}), 500
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 
 @app.route('/conversations', methods=['GET'])
