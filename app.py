@@ -149,26 +149,36 @@ def send_whatsapp_message(to_number, message):
 
 def send_whatsapp_template(to_number, template_sid, variables):
     """Send a template-based WhatsApp message (required for first contact)."""
+    global _last_send_error
+    _last_send_error = None
     try:
         if client is None:
-            print('Twilio client not configured; template not sent.')
+            _last_send_error = 'Twilio client not configured (TWILIO_ACCOUNT_SID missing?)'
+            print(_last_send_error)
             return None
         if not to_number.startswith('whatsapp:'):
             to_number = f'whatsapp:{to_number}'
+        # Remove non-Twilio keys from variables
+        twilio_vars = {k: v for k, v in variables.items() if k != 'fallback_text'}
+        print(f'Sending template {template_sid} to {to_number} from {TWILIO_WHATSAPP_NUMBER}')
         sent = client.messages.create(
             from_=TWILIO_WHATSAPP_NUMBER,
             to=to_number,
             content_sid=template_sid,
-            content_variables=json.dumps(variables),
+            content_variables=json.dumps(twilio_vars),
         )
+        print(f'Template sent OK: {sent.sid}')
         return sent.sid
     except Exception as e:
+        _last_send_error = str(e)
         print(f'Error sending template: {e}')
         fallback_msg = variables.get('fallback_text', '')
         if fallback_msg:
             print('Attempting fallback with free-form message...')
             return send_whatsapp_message(to_number, fallback_msg)
         return None
+
+_last_send_error = None
 
 
 # --- Availability logic (uses panel API) ------------------------------------
@@ -462,7 +472,17 @@ def initiate_appointment():
                 'message_sid': message_sid,
                 'zone': get_zone_for_location(location) if location else None,
             })
-        return jsonify({'success': False, 'error': 'Failed to send WhatsApp message'}), 500
+        return jsonify({
+            'success': False,
+            'error': 'Failed to send WhatsApp message',
+            'detail': _last_send_error,
+            'debug': {
+                'twilio_configured': client is not None,
+                'from_number': TWILIO_WHATSAPP_NUMBER,
+                'to_number': customer_phone,
+                'template_sid': template_sid,
+            }
+        }), 500
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
