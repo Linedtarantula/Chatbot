@@ -25,7 +25,7 @@ from flask_cors import CORS
 from twilio.rest import Client
 from twilio.twiml.messaging_response import MessagingResponse
 
-from zones import get_zone_for_location
+from zones import get_zone_for_location, get_travel_time
 
 # --- Config -----------------------------------------------------------------
 PANEL_API_URL = os.environ.get('PANEL_API_URL', 'https://agendainstalacionesventura.abacusai.app')
@@ -55,11 +55,56 @@ client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN) if TWILIO_ACCOUNT_SID els
 # In-memory conversation state for the WhatsApp flow.
 conversations = {}
 
+# --- Temporary slot reservations (anti-overlap) ----------------------------
+# key: "YYYY-MM-DD_HH:MM" -> {phone, expires_at}
+slot_reservations = {}
+RESERVATION_MINUTES = 15
+
+
+def _cleanup_expired_reservations():
+    """Remove expired slot reservations."""
+    now = datetime.now()
+    expired = [k for k, v in slot_reservations.items() if v['expires_at'] <= now]
+    for k in expired:
+        del slot_reservations[k]
+
+
+def _reserve_slots(slots, customer_phone):
+    """Temporarily reserve slots (15 min) to prevent double-booking."""
+    _cleanup_expired_reservations()
+    expires_at = datetime.now() + timedelta(minutes=RESERVATION_MINUTES)
+    for slot in slots:
+        key = f"{slot['date']}_{slot['start_time']}"
+        slot_reservations[key] = {'phone': customer_phone, 'expires_at': expires_at}
+    print(f'Reserved {len(slots)} slots for {customer_phone} until {expires_at.strftime("%H:%M")}')
+
+
+def _release_slots(customer_phone):
+    """Release all slots reserved by a specific customer."""
+    keys_to_remove = [k for k, v in slot_reservations.items() if v['phone'] == customer_phone]
+    for k in keys_to_remove:
+        del slot_reservations[k]
+    if keys_to_remove:
+        print(f'Released {len(keys_to_remove)} reserved slots for {customer_phone}')
+
+
+def _is_slot_reserved(date_str, time_str, exclude_phone=None):
+    """Check if a slot is reserved by someone else."""
+    _cleanup_expired_reservations()
+    key = f"{date_str}_{time_str}"
+    reservation = slot_reservations.get(key)
+    if not reservation:
+        return False
+    if exclude_phone and reservation['phone'] == exclude_phone:
+        return False
+    return True
+
 
 class ConversationState:
     GREETING = 'greeting'
     PROPOSING_SLOTS = 'proposing_slots'
     WAITING_CHOICE = 'waiting_choice'
+    CONFIRMING_ADDRESS = 'confirming_address'  # Confirm/correct address before final
     CONFIRMING = 'confirming'
     COMPLETED = 'completed'
     CANCELLED = 'cancelled'
@@ -190,6 +235,120 @@ def send_whatsapp_template(to_number, template_sid, variables):
 _last_send_error = None
 
 
+# --- Quick Reply Buttons (Twilio Content API) --------------------------------
+# Cache for content template SIDs (created once, reused)
+_content_sids = {}
+
+
+def _ensure_content_templates():
+    """Create or find reusable quick-reply templates for in-session messages."""
+    global _content_sids
+    if _content_sids:
+        return _content_sids
+    if not client:
+        return {}
+
+    templates_to_create = {
+        'slots_3': {
+            'friendly_name': 'ventura_slots_3opt_v1',
+            'body': '{{1}}',
+            'actions': [
+                {'title': 'Opción 1', 'id': '1'},
+                {'title': 'Opción 2', 'id': '2'},
+                {'title': 'Opción 3', 'id': '3'},
+            ]
+        },
+        'slots_2': {
+            'friendly_name': 'ventura_slots_2opt_v1',
+            'body': '{{1}}',
+            'actions': [
+                {'title': 'Opción 1', 'id': '1'},
+                {'title': 'Opción 2', 'id': '2'},
+            ]
+        },
+        'slots_1': {
+            'friendly_name': 'ventura_slots_1opt_v1',
+            'body': '{{1}}',
+            'actions': [
+                {'title': 'Sí, me viene bien', 'id': '1'},
+                {'title': 'Prefiero otra fecha', 'id': 'no'},
+            ]
+        },
+        'confirm_yesno': {
+            'friendly_name': 'ventura_confirm_yn_v1',
+            'body': '{{1}}',
+            'actions': [
+                {'title': 'Sí, confirmo ✅', 'id': 'si'},
+                {'title': 'Cambiar algo', 'id': 'no'},
+            ]
+        },
+        'address_check': {
+            'friendly_name': 'ventura_address_v1',
+            'body': '{{1}}',
+            'actions': [
+                {'title': 'Sí, es correcta', 'id': 'si'},
+                {'title': 'No, es otra', 'id': 'no'},
+            ]
+        },
+    }
+
+    # Try to find existing templates first
+    try:
+        existing = client.content.v1.contents.list()
+        existing_map = {c.friendly_name: c.sid for c in existing}
+    except Exception as e:
+        print(f'Could not list content templates: {e}')
+        existing_map = {}
+
+    for key, tmpl in templates_to_create.items():
+        if tmpl['friendly_name'] in existing_map:
+            _content_sids[key] = existing_map[tmpl['friendly_name']]
+            print(f'Content template "{key}" found: {_content_sids[key]}')
+            continue
+        try:
+            content = client.content.v1.contents.create(
+                friendly_name=tmpl['friendly_name'],
+                language='es',
+                types=json.dumps({
+                    'twilio/quick-reply': {
+                        'body': tmpl['body'],
+                        'actions': tmpl['actions'],
+                    }
+                }),
+            )
+            _content_sids[key] = content.sid
+            print(f'Content template "{key}" created: {content.sid}')
+        except Exception as e:
+            print(f'Error creating content template "{key}": {e}')
+
+    return _content_sids
+
+
+def send_whatsapp_buttons(to_number, body_text, template_key):
+    """Send a WhatsApp message with quick-reply buttons.
+    Falls back to plain text if buttons are not available."""
+    sids = _ensure_content_templates()
+    content_sid = sids.get(template_key)
+
+    if not content_sid:
+        return send_whatsapp_message(to_number, body_text)
+
+    try:
+        if not to_number.startswith('whatsapp:'):
+            to_number = f'whatsapp:{to_number}'
+        sent = client.messages.create(
+            from_=TWILIO_WHATSAPP_NUMBER,
+            to=to_number,
+            content_sid=content_sid,
+            content_variables=json.dumps({'1': body_text}),
+        )
+        print(f'Buttons ({template_key}) sent OK: {sent.sid}')
+        return sent.sid
+    except Exception as e:
+        print(f'Error sending buttons, falling back to text: {e}')
+        return send_whatsapp_message(to_number, body_text)
+
+
 # --- Availability logic (uses panel API) ------------------------------------
 
 def _time_to_minutes(ts):
@@ -202,26 +361,41 @@ def _minutes_to_time(total_min):
     return f"{h:02d}:{m:02d}"
 
 
-def _overlaps_any(start_min, end_min, day_appts):
+def _overlaps_any(start_min, end_min, day_appts, new_zone=None):
     """Check if [start_min, end_min) overlaps any existing appointment.
-    Includes TRAVEL_BUFFER_MIN after each existing appointment for travel time."""
+    Uses zone-aware travel buffer: if the new appointment is in a different
+    zone from an existing one, uses the real inter-zone travel time.
+    Also checks temporary slot reservations."""
     for appt in day_appts:
         appt_start_str = appt.get('timeStart', '')
         if not appt_start_str:
             continue
         appt_start = _time_to_minutes(appt_start_str)
         appt_duration = appt.get('duration', 90) or 90
-        # Add travel buffer after the appointment
-        appt_end_with_travel = appt_start + appt_duration + TRAVEL_BUFFER_MIN
-        if start_min < appt_end_with_travel and end_min > appt_start:
+
+        # Calculate zone-aware travel buffer
+        appt_zone = get_zone_for_location(appt.get('locality', ''))
+        if new_zone and appt_zone:
+            travel = get_travel_time(new_zone, appt_zone)
+        else:
+            travel = TRAVEL_BUFFER_MIN  # default 30 min
+
+        # Buffer after existing appointment (travel TO new)
+        appt_end_with_travel = appt_start + appt_duration + travel
+        # Buffer before existing appointment (travel FROM new)
+        new_end_with_travel = end_min + travel
+
+        if start_min < appt_end_with_travel and new_end_with_travel > appt_start:
             return True
     return False
 
 
-def _free_slots_for_day(day_date, duration_min, day_appts):
-    """Return valid start datetimes for a given day (no overlaps)."""
+def _free_slots_for_day(day_date, duration_min, day_appts,
+                        new_zone=None, exclude_phone=None):
+    """Return valid start datetimes for a given day (no overlaps, no reservations)."""
     day_start = WORK_START_HOUR * 60
     day_end = WORK_END_HOUR * 60
+    day_str = day_date.isoformat()
 
     now = datetime.now()
     if day_date == now.date():
@@ -234,7 +408,12 @@ def _free_slots_for_day(day_date, duration_min, day_appts):
 
     free = []
     while cursor + duration_min <= day_end:
-        if not _overlaps_any(cursor, cursor + duration_min, day_appts):
+        slot_time = _minutes_to_time(cursor)
+        # Check reservation by another client
+        if _is_slot_reserved(day_str, slot_time, exclude_phone=exclude_phone):
+            cursor += 30
+            continue
+        if not _overlaps_any(cursor, cursor + duration_min, day_appts, new_zone=new_zone):
             slot_dt = datetime.combine(day_date, dtime(cursor // 60, cursor % 60))
             free.append(slot_dt)
             cursor += duration_min
@@ -259,8 +438,12 @@ def _build_slot(slot_start, duration_min, in_zone=False, zone_note=None):
 
 
 def find_available_slots(duration_hours=DEFAULT_DURATION_HOURS, num_slots=3,
-                         days_ahead=14, preferred_zone=None):
-    """Find available time slots using the panel API data."""
+                         days_ahead=14, preferred_zone=None,
+                         exclude_phone=None):
+    """Find available time slots using the panel API data.
+    - Prioritises days that already have appointments in the same zone.
+    - Uses zone-aware travel buffers.
+    - Excludes slots reserved by other clients."""
     if not duration_hours or duration_hours <= 0:
         duration_hours = DEFAULT_DURATION_HOURS
     duration_min = int(duration_hours * 60)
@@ -287,7 +470,7 @@ def find_available_slots(duration_hours=DEFAULT_DURATION_HOURS, num_slots=3,
     # Blocked days set
     blocked_set = {bd['date'] for bd in all_blocked}
 
-    # Zone appointments per day
+    # Zone appointments per day — which days already have work in the same zone
     zone_days = {}
     if preferred_zone:
         for appt in all_appointments:
@@ -304,7 +487,9 @@ def find_available_slots(duration_hours=DEFAULT_DURATION_HOURS, num_slots=3,
         if day_str in blocked_set:
             continue
         day_appts = appts_by_day.get(day_str, [])
-        day_slots = _free_slots_for_day(day, duration_min, day_appts)
+        day_slots = _free_slots_for_day(day, duration_min, day_appts,
+                                        new_zone=preferred_zone,
+                                        exclude_phone=exclude_phone)
         if not day_slots:
             continue
         in_zone = day_str in zone_days
@@ -316,7 +501,7 @@ def find_available_slots(duration_hours=DEFAULT_DURATION_HOURS, num_slots=3,
             'zone_appts': zone_days.get(day_str, []),
         })
 
-    # Prioritise same-zone days
+    # Prioritise same-zone days (less travel for the installer)
     candidate_days.sort(key=lambda d: (not d['in_zone'], d['date']))
 
     slots = []
@@ -360,11 +545,70 @@ def generate_time_slots(duration_hours=DEFAULT_DURATION_HOURS, num_slots=3):
     return slots
 
 
-def build_time_slots(duration_hours, location, num_slots=3):
+def check_specific_slot(preferred_date, preferred_time, duration_hours=DEFAULT_DURATION_HOURS):
+    """Check if a specific date/time slot is available.
+    Returns the slot dict if available, or None with a reason if not."""
+    duration_min = int(duration_hours * 60)
+    try:
+        day = datetime.strptime(preferred_date, '%Y-%m-%d').date()
+    except (ValueError, TypeError):
+        return None, 'Fecha no válida'
+
+    # Check if it's a weekend
+    if day.weekday() >= 5:
+        return None, f'El {format_date_es(day)} es fin de semana'
+
+    # Check if day is in the past
+    if day <= datetime.now().date():
+        return None, 'La fecha debe ser posterior a hoy'
+
+    # Parse the requested time
+    if not preferred_time:
+        preferred_time = f'{WORK_START_HOUR:02d}:00'
+    start_min = _time_to_minutes(preferred_time)
+    end_min = start_min + duration_min
+
+    # Check working hours
+    if start_min < WORK_START_HOUR * 60 or end_min > WORK_END_HOUR * 60:
+        return None, f'El horario {preferred_time} está fuera del horario laboral ({WORK_START_HOUR:02d}:00 - {WORK_END_HOUR:02d}:00)'
+
+    day_str = day.isoformat()
+
+    # Check blocked day
+    blocked = _fetch_blocked_days(day_str, day_str)
+    if blocked:
+        return None, f'El {format_date_es(day)} está bloqueado'
+
+    # Check overlaps with existing appointments
+    appointments = _fetch_appointments(day_str, day_str)
+    cancelled_statuses = {'cancelled', 'cancelada'}
+    active_appts = [a for a in appointments if a.get('status', 'pending') not in cancelled_statuses]
+
+    if _overlaps_any(start_min, end_min, active_appts):
+        return None, f'El hueco el {format_date_es(day)} a las {preferred_time} ya está ocupado'
+
+    # Slot is available — build it
+    slot_dt = datetime.combine(day, dtime(start_min // 60, start_min % 60))
+    slot = _build_slot(slot_dt, duration_min)
+    return slot, None
+
+
+def build_time_slots(duration_hours, location, num_slots=3,
+                     preferred_date=None, preferred_time=None,
+                     exclude_phone=None):
+    """Build time slots. If preferred_date is given, try that specific slot first."""
+    # If a specific date/time is requested, check that first
+    if preferred_date:
+        slot, reason = check_specific_slot(preferred_date, preferred_time, duration_hours)
+        if slot:
+            return [slot]
+        else:
+            print(f'Requested slot {preferred_date} {preferred_time} not available: {reason}')
+
     preferred_zone = get_zone_for_location(location) if location else None
     slots = find_available_slots(
         duration_hours=duration_hours, num_slots=num_slots,
-        preferred_zone=preferred_zone)
+        preferred_zone=preferred_zone, exclude_phone=exclude_phone)
     if slots:
         return slots
     return generate_time_slots(duration_hours=duration_hours, num_slots=num_slots)
@@ -435,7 +679,14 @@ def initiate_appointment():
 
         duration = float(data.get('duration_hours') or DEFAULT_DURATION_HOURS)
         location = (data.get('location') or '').strip()
-        time_slots = build_time_slots(duration, location, num_slots=3)
+        preferred_date = (data.get('preferred_date') or '').strip() or None
+        preferred_time = (data.get('preferred_time') or '').strip() or None
+        time_slots = build_time_slots(duration, location, num_slots=3,
+                                       preferred_date=preferred_date,
+                                       preferred_time=preferred_time,
+                                       exclude_phone=customer_phone)
+        # Reserve these slots temporarily (15 min) to prevent double-booking
+        _reserve_slots(time_slots, customer_phone)
 
         conversation_id = f"{customer_phone}_{int(time.time())}"
         conversations[customer_phone] = {
@@ -475,6 +726,17 @@ def initiate_appointment():
         }
         message_sid = send_whatsapp_template(customer_phone, template_sid, template_vars)
 
+        # Track if a specific slot was requested
+        slot_info = {}
+        if preferred_date:
+            slot_info['preferred_date'] = preferred_date
+            slot_info['preferred_time'] = preferred_time
+            if len(time_slots) == 1:
+                slot_info['specific_slot_found'] = True
+            else:
+                slot_info['specific_slot_found'] = False
+                slot_info['fallback_reason'] = 'Slot not available, showing alternatives'
+
         if message_sid:
             conversations[customer_phone]['state'] = ConversationState.PROPOSING_SLOTS
             # Init message log
@@ -489,6 +751,8 @@ def initiate_appointment():
                 'message': 'Appointment scheduling initiated',
                 'message_sid': message_sid,
                 'zone': get_zone_for_location(location) if location else None,
+                'slot_info': slot_info,
+                'slots_proposed': len(time_slots),
             })
         return jsonify({
             'success': False,
@@ -511,18 +775,53 @@ def _format_slots_message(conversation):
     for i, slot in enumerate(slots):
         lines.append(f"{i + 1}. {slot['formatted']} (aprox. hasta las {slot['end_time']})")
     slots_text = '\n'.join(lines)
-    return (
-        f"Estas son las fechas que tengo disponibles:\n\n"
-        f"{slots_text}\n\n"
-        f"¿Cuál le viene mejor? Puede responderme con el número de la opción (1, 2 o 3).\n\n"
-        f"Si ninguna le encaja, indíquemelo y buscaremos otra fecha."
-    )
+
+    if len(slots) == 1:
+        return (
+            f"Le propongo la siguiente fecha:\n\n"
+            f"{slots_text}\n\n"
+            f"¿Le viene bien?"
+        )
+    else:
+        return (
+            f"Estas son las fechas que tengo disponibles:\n\n"
+            f"{slots_text}\n\n"
+            f"¿Cuál le viene mejor?"
+        )
+
+
+def _get_slots_button_key(num_slots):
+    """Return the content template key for the number of slot options."""
+    if num_slots == 1:
+        return 'slots_1'
+    elif num_slots == 2:
+        return 'slots_2'
+    else:
+        return 'slots_3'
+
+
+def _send_and_log(conversation, to_number, text, button_key=None):
+    """Send a message (with buttons if possible) and log it."""
+    if button_key:
+        sid = send_whatsapp_buttons(to_number, text, button_key)
+    else:
+        sid = send_whatsapp_message(to_number, text)
+    if 'message_log' not in conversation:
+        conversation['message_log'] = []
+    conversation['message_log'].append({
+        'from': 'bot', 'text': text, 'time': datetime.now().strftime('%H:%M')
+    })
+    return sid
 
 
 @app.route('/webhook/whatsapp', methods=['POST'])
 def whatsapp_webhook():
     try:
         incoming_msg = request.values.get('Body', '').strip().lower()
+        button_payload = request.values.get('ButtonPayload', '').strip()
+        # Use button payload if available (more reliable than free text)
+        user_choice = button_payload or incoming_msg
+
         from_number = request.values.get('From', '')
         customer_phone = from_number.replace('whatsapp:', '')
         response = MessagingResponse()
@@ -547,7 +846,6 @@ def whatsapp_webhook():
         })
 
         if state == ConversationState.NEEDS_MANUAL:
-            # Client wrote again while waiting for manual intervention
             _notify_installer(
                 f"💬 *Mensaje de cliente en espera*\n\n"
                 f"👤 {conversation.get('customer_name', 'Cliente')}\n"
@@ -560,45 +858,81 @@ def whatsapp_webhook():
                 'y se pondrá en contacto con usted en breve.')
             return str(response)
 
+        # --- PROPOSING SLOTS (first response from client after template) ---
         if state == ConversationState.PROPOSING_SLOTS:
+            slots = conversation['time_slots']
             slots_msg = _format_slots_message(conversation)
-            response.message(slots_msg)
-            conversation['message_log'].append({'from': 'bot', 'text': slots_msg, 'time': datetime.now().strftime('%H:%M')})
+            btn_key = _get_slots_button_key(len(slots))
+            _send_and_log(conversation, customer_phone, slots_msg, button_key=btn_key)
             conversation['state'] = ConversationState.WAITING_CHOICE
+            # Return empty TwiML since we sent via REST API
+            return str(MessagingResponse())
 
+        # --- WAITING FOR SLOT CHOICE ---
         elif state == ConversationState.WAITING_CHOICE:
-            if incoming_msg in ['1', '2', '3']:
-                idx = int(incoming_msg) - 1
-                slots = conversation['time_slots']
+            slots = conversation['time_slots']
+            num_options = len(slots)
+            valid_options = [str(i) for i in range(1, num_options + 1)]
+
+            # Accept button payload, number, or affirmative text
+            is_affirmative = num_options == 1 and any(
+                w in user_choice for w in ['si', 'sí', 'vale', 'ok', 'bien', 'perfecto', 'correcto']
+            )
+            is_rejection = user_choice == 'no' or any(
+                w in incoming_msg for w in ['no', 'ninguna', 'otra']
+            )
+
+            if user_choice in valid_options or is_affirmative:
+                idx = 0 if is_affirmative else int(user_choice) - 1
                 if idx >= len(slots):
-                    response.message('Esa opción no está disponible. Por favor, indíqueme '
-                                     'una de las opciones que le he propuesto.')
+                    response.message('Esa opción no está disponible.')
                     return str(response)
+
                 selected_slot = slots[idx]
                 conversation['selected_slot'] = selected_slot
-                work_type = conversation['work_type'] or 'la instalación'
-                address = conversation['address'] or 'la dirección indicada'
-                location = conversation['location']
-                duration = conversation['duration_hours']
+                # Release un-selected reserved slots
+                _release_slots(customer_phone)
+                # Re-reserve only the selected slot
+                _reserve_slots([selected_slot], customer_phone)
+
+                # --- Ask to confirm/correct the address ---
+                address = conversation.get('address') or ''
+                location = conversation.get('location') or ''
                 address_line = address
-                if location and location.lower() not in address.lower():
+                if location and address and location.lower() not in address.lower():
                     address_line = f'{address} ({location})'
-                response.message(
-                    f'Perfecto. Le confirmo los datos de la cita:\n\n'
-                    f"📅 {selected_slot['formatted']}\n"
-                    f'⏱️ Duración aproximada: {duration} horas\n'
-                    f'📍 Dirección: {address_line}\n'
-                    f'🔧 Trabajo: {work_type}\n\n'
-                    f'¿Es todo correcto? Responda SÍ para confirmar la cita o NO si '
-                    f'necesita que cambiemos algo.')
-                conversation['state'] = ConversationState.CONFIRMING
-            elif 'no' in incoming_msg or 'ninguna' in incoming_msg:
+                elif not address and location:
+                    address_line = location
+                elif not address:
+                    address_line = ''
+
+                if address_line:
+                    addr_msg = (
+                        f"Perfecto, {selected_slot['formatted']}.\n\n"
+                        f"La dirección que tengo para la instalación es:\n"
+                        f"📍 {address_line}\n\n"
+                        f"¿Es correcta?"
+                    )
+                    _send_and_log(conversation, customer_phone, addr_msg, button_key='address_check')
+                    conversation['state'] = ConversationState.CONFIRMING_ADDRESS
+                else:
+                    # No address on file, ask for it
+                    addr_msg = (
+                        f"Perfecto, {selected_slot['formatted']}.\n\n"
+                        f"¿Podría indicarme la dirección exacta donde se realizará "
+                        f"la instalación?"
+                    )
+                    _send_and_log(conversation, customer_phone, addr_msg)
+                    conversation['state'] = ConversationState.CONFIRMING_ADDRESS
+                return str(MessagingResponse())
+
+            elif is_rejection:
                 response.message(
                     'Entendido, no se preocupe. Le paso su solicitud al instalador '
                     'para que le proponga otras fechas. Se pondrá en contacto con usted '
                     'a la mayor brevedad. Gracias por su paciencia.')
                 conversation['state'] = ConversationState.NEEDS_MANUAL
-                # Notify installer
+                _release_slots(customer_phone)
                 _notify_installer(
                     f"⚠️ *Cliente necesita otras fechas*\n\n"
                     f"👤 {conversation.get('customer_name', 'Cliente')}\n"
@@ -610,18 +944,76 @@ def whatsapp_webhook():
                     f"Revisa la agenda y contacta al cliente directamente."
                 )
             else:
-                response.message(
-                    'Disculpe, no le he entendido. ¿Podría indicarme el número de la '
-                    'opción que prefiere (1, 2 o 3)? Si ninguna le viene bien, dígamelo '
-                    'y le busco otras fechas.')
+                slots_msg = _format_slots_message(conversation)
+                hint = (
+                    f"Disculpe, no le he entendido.\n\n{slots_msg}\n\n"
+                    f"Pulse un botón o escriba el número de la opción."
+                )
+                _send_and_log(conversation, customer_phone, hint,
+                              button_key=_get_slots_button_key(len(slots)))
+                return str(MessagingResponse())
 
+        # --- CONFIRMING ADDRESS ---
+        elif state == ConversationState.CONFIRMING_ADDRESS:
+            is_address_ok = user_choice in ['si'] or any(
+                w in user_choice for w in ['si', 'sí', 'vale', 'ok', 'correcta', 'correcto', 'bien']
+            )
+
+            if is_address_ok:
+                # Address confirmed, show full summary
+                pass  # fall through to send confirmation below
+            else:
+                # Client provided a new/corrected address
+                new_address = request.values.get('Body', '').strip()
+                if new_address and user_choice != 'no':
+                    conversation['address'] = new_address
+                    addr_confirm = (
+                        f"Gracias, he actualizado la dirección a:\n"
+                        f"📍 {new_address}\n\n"
+                        f"¿Es correcta ahora?"
+                    )
+                    _send_and_log(conversation, customer_phone, addr_confirm, button_key='address_check')
+                    return str(MessagingResponse())
+                elif user_choice == 'no':
+                    ask_msg = '¿Cuál es la dirección correcta? Escríbamela, por favor.'
+                    _send_and_log(conversation, customer_phone, ask_msg)
+                    return str(MessagingResponse())
+
+            # Show full confirmation summary
+            selected_slot = conversation['selected_slot']
+            work_type = conversation.get('work_type') or 'la instalación'
+            address = conversation.get('address') or 'la dirección indicada'
+            location = conversation.get('location') or ''
+            duration = conversation.get('duration_hours') or DEFAULT_DURATION_HOURS
+            address_line = address
+            if location and location.lower() not in address.lower():
+                address_line = f'{address} ({location})'
+
+            confirm_msg = (
+                f'Perfecto. Le confirmo los datos de la cita:\n\n'
+                f"📅 {selected_slot['formatted']}\n"
+                f'⏱️ Duración aproximada: {duration} horas\n'
+                f'📍 Dirección: {address_line}\n'
+                f'🔧 Trabajo: {work_type}\n\n'
+                f'¿Todo correcto?'
+            )
+            _send_and_log(conversation, customer_phone, confirm_msg, button_key='confirm_yesno')
+            conversation['state'] = ConversationState.CONFIRMING
+            return str(MessagingResponse())
+
+        # --- FINAL CONFIRMATION ---
         elif state == ConversationState.CONFIRMING:
-            if any(w in incoming_msg for w in ['si', 'sí', 'vale', 'ok', 'correcto', 'confirmo']):
+            is_confirmed = user_choice == 'si' or any(
+                w in user_choice for w in ['si', 'sí', 'vale', 'ok', 'correcto', 'confirmo']
+            )
+            if is_confirmed:
                 selected_slot = conversation['selected_slot']
                 try:
                     create_appointment_via_api(conversation, selected_slot)
                 except Exception as e:
                     print(f'Error saving appointment: {e}')
+                # Release reservations
+                _release_slots(customer_phone)
                 response.message(
                     f"Estupendo. Su cita ha quedado confirmada. ✅\n\n"
                     f"Le espero el {selected_slot['formatted']}.\n\n"
@@ -629,7 +1021,6 @@ def whatsapp_webhook():
                     f'imprevisto, le agradecería que me avisara con antelación.\n\n'
                     f'Muchas gracias por su tiempo. Un saludo.')
                 conversation['state'] = ConversationState.COMPLETED
-                # Notify installer about the confirmed appointment
                 work_type = conversation.get('work_type') or 'Instalación'
                 _notify_installer(
                     f"✅ *Cita confirmada*\n\n"
@@ -640,6 +1031,9 @@ def whatsapp_webhook():
                     f"📞 {conversation.get('customer_phone', '')}\n\n"
                     f"La cita se ha guardado en tu agenda automáticamente."
                 )
+            elif user_choice == 'no':
+                response.message('Por supuesto. ¿Qué necesita que modifiquemos? Dígame y '
+                                 'lo ajustamos enseguida.')
             else:
                 response.message('Por supuesto. ¿Qué necesita que modifiquemos? Dígame y '
                                  'lo ajustamos enseguida.')
@@ -701,9 +1095,10 @@ def manual_reply():
             lines = []
             for i, slot in enumerate(slots):
                 lines.append(f"{i + 1}. {slot['formatted']} (aprox. hasta las {slot['end_time']})")
+            slots_text = '\n'.join(lines)
             msg = (
                 f"Disculpe la espera. He revisado mi agenda y le puedo ofrecer estas otras fechas:\n\n"
-                f"{'\n'.join(lines)}\n\n"
+                f"{slots_text}\n\n"
                 f"¿Cuál le viene mejor? Responda con el número de la opción."
             )
             message_sid = send_whatsapp_message(customer_phone, msg)
@@ -742,6 +1137,7 @@ def list_conversations():
                 'greeting': 'Saludo enviado',
                 'proposing_slots': 'Proponiendo fechas',
                 'waiting_choice': 'Esperando respuesta del cliente',
+                'confirming_address': 'Confirmando dirección',
                 'confirming': 'Esperando confirmación',
                 'completed': '✅ Cita confirmada',
                 'cancelled': '❌ Cancelada',
@@ -754,7 +1150,7 @@ def list_conversations():
     # Sort: needs_manual first, then by created_at desc
     result.sort(key=lambda c: (
         0 if c['state'] == 'needs_manual' else
-        1 if c['state'] in ('waiting_choice', 'confirming', 'proposing_slots', 'greeting') else 2,
+        1 if c['state'] in ('waiting_choice', 'confirming_address', 'confirming', 'proposing_slots', 'greeting') else 2,
         c.get('created_at', '') or ''
     ), reverse=False)
     return jsonify(result)
@@ -826,6 +1222,45 @@ def send_daily_reminder():
         return jsonify({'success': False, 'error': 'Failed to send WhatsApp reminder'}), 500
     except Exception as e:
         print(f'Error in send_daily_reminder: {e}')
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+
+# ===========================================================================
+# Check slot availability
+# ===========================================================================
+
+@app.route('/check-availability', methods=['POST'])
+def check_availability():
+    """Check if a specific date/time slot is available.
+    Useful for the chatbot to verify before initiating."""
+    try:
+        data = request.json or {}
+        preferred_date = data.get('date') or data.get('preferred_date')
+        preferred_time = data.get('time') or data.get('preferred_time')
+        duration_hours = float(data.get('duration_hours') or DEFAULT_DURATION_HOURS)
+
+        if not preferred_date:
+            return jsonify({'success': False, 'error': 'date is required'}), 400
+
+        slot, reason = check_specific_slot(preferred_date, preferred_time, duration_hours)
+        if slot:
+            return jsonify({
+                'success': True,
+                'available': True,
+                'slot': {
+                    'date': slot['date'],
+                    'start_time': slot['start_time'],
+                    'end_time': slot['end_time'],
+                    'formatted': slot['formatted'],
+                }
+            })
+        else:
+            return jsonify({
+                'success': True,
+                'available': False,
+                'reason': reason,
+            })
+    except Exception as e:
         return jsonify({'success': False, 'error': str(e)}), 500
 
 

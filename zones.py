@@ -53,3 +53,34 @@ def locations_same_zone(loc_a, loc_b):
         return True
     za, zb = get_zone_for_location(loc_a), get_zone_for_location(loc_b)
     return bool(za and zb and za == zb)
+
+
+# --- Travel times between zones (minutes, one-way by car) ------------------
+# Approximate driving times between zone centres in the province of Huelva.
+# Used to calculate realistic buffers when appointments span different zones.
+INTER_ZONE_TRAVEL = {
+    ('Costa Occidental', 'Huelva Capital'): 35,
+    ('Costa Occidental', 'Condado'): 45,
+    ('Costa Occidental', 'Sierra'): 110,
+    ('Huelva Capital', 'Condado'): 25,
+    ('Huelva Capital', 'Sierra'): 80,
+    ('Condado', 'Sierra'): 70,
+}
+
+# Within the same zone
+SAME_ZONE_TRAVEL = 20
+
+
+def get_travel_time(zone_a, zone_b):
+    """Return estimated travel time in minutes between two zones.
+    Returns SAME_ZONE_TRAVEL for same zone, or a lookup value for
+    different zones, defaulting to 60 min for unknown combinations."""
+    if not zone_a or not zone_b:
+        return 30  # unknown zone, use default
+    if zone_a == zone_b:
+        return SAME_ZONE_TRAVEL
+    # Try both orderings
+    t = INTER_ZONE_TRAVEL.get((zone_a, zone_b))
+    if t is None:
+        t = INTER_ZONE_TRAVEL.get((zone_b, zone_a))
+    return t if t is not None else 60  # default for unknown combos
