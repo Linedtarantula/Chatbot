@@ -45,6 +45,7 @@ WORK_START_HOUR = 8
 WORK_END_HOUR = 16
 DEFAULT_DURATION_HOURS = 1.5
 DEFAULT_DURATION_MIN = 90
+TRAVEL_BUFFER_MIN = 30  # 30 min de desplazamiento entre citas
 
 app = Flask(__name__)
 CORS(app)
@@ -62,6 +63,14 @@ class ConversationState:
     CONFIRMING = 'confirming'
     COMPLETED = 'completed'
     CANCELLED = 'cancelled'
+    NEEDS_MANUAL = 'needs_manual'  # Client rejected dates, installer must intervene
+
+
+def _notify_installer(message):
+    """Send a notification to the installer's WhatsApp."""
+    installer_number = INSTALLER_PHONE_NUMBER or TWILIO_WHATSAPP_NUMBER.replace('whatsapp:', '')
+    if installer_number:
+        send_whatsapp_message(installer_number, message)
 
 
 # --- Spanish date formatting ------------------------------------------------
@@ -194,14 +203,17 @@ def _minutes_to_time(total_min):
 
 
 def _overlaps_any(start_min, end_min, day_appts):
-    """Check if [start_min, end_min) overlaps any existing appointment."""
+    """Check if [start_min, end_min) overlaps any existing appointment.
+    Includes TRAVEL_BUFFER_MIN after each existing appointment for travel time."""
     for appt in day_appts:
         appt_start_str = appt.get('timeStart', '')
         if not appt_start_str:
             continue
         appt_start = _time_to_minutes(appt_start_str)
-        appt_end = appt_start + (appt.get('duration', 90) or 90)
-        if start_min < appt_end and end_min > appt_start:
+        appt_duration = appt.get('duration', 90) or 90
+        # Add travel buffer after the appointment
+        appt_end_with_travel = appt_start + appt_duration + TRAVEL_BUFFER_MIN
+        if start_min < appt_end_with_travel and end_min > appt_start:
             return True
     return False
 
@@ -465,6 +477,12 @@ def initiate_appointment():
 
         if message_sid:
             conversations[customer_phone]['state'] = ConversationState.PROPOSING_SLOTS
+            # Init message log
+            conversations[customer_phone]['message_log'] = [{
+                'from': 'bot',
+                'text': f'Plantilla de saludo enviada ({message_type})',
+                'time': datetime.now().strftime('%H:%M'),
+            }]
             return jsonify({
                 'success': True,
                 'conversation_id': conversation_id,
@@ -490,24 +508,14 @@ def initiate_appointment():
 def _format_slots_message(conversation):
     slots = conversation['time_slots']
     lines = []
-    zone_notes = []
     for i, slot in enumerate(slots):
-        marker = ' ⭐' if slot.get('in_zone') else ''
-        lines.append(f"{i + 1}. {slot['formatted']} (aprox. hasta las {slot['end_time']}){marker}")
-        if slot.get('zone_note') and slot['zone_note'] not in zone_notes:
-            zone_notes.append(slot['zone_note'])
+        lines.append(f"{i + 1}. {slot['formatted']} (aprox. hasta las {slot['end_time']})")
     slots_text = '\n'.join(lines)
-    zone_block = ''
-    if zone_notes:
-        zone_block = (
-            '\n\nℹ️ Ese/esos días ya tengo desplazamiento a su zona, por lo que me '
-            'vendría muy bien poder atenderle también a usted:\n- ' + '\n- '.join(zone_notes)
-        )
     return (
-        f"Le agradezco su disponibilidad. Estas son las fechas que tengo libres:\n\n"
-        f"{slots_text}{zone_block}\n\n"
+        f"Estas son las fechas que tengo disponibles:\n\n"
+        f"{slots_text}\n\n"
         f"¿Cuál le viene mejor? Puede responderme con el número de la opción (1, 2 o 3).\n\n"
-        f"Si ninguna le encaja, indíquemelo y le busco otras fechas sin problema."
+        f"Si ninguna le encaja, indíquemelo y buscaremos otra fecha."
     )
 
 
@@ -529,8 +537,33 @@ def whatsapp_webhook():
         conversation = conversations[customer_phone]
         state = conversation['state']
 
+        # Log incoming message
+        if 'message_log' not in conversation:
+            conversation['message_log'] = []
+        conversation['message_log'].append({
+            'from': 'cliente',
+            'text': request.values.get('Body', '').strip(),
+            'time': datetime.now().strftime('%H:%M'),
+        })
+
+        if state == ConversationState.NEEDS_MANUAL:
+            # Client wrote again while waiting for manual intervention
+            _notify_installer(
+                f"💬 *Mensaje de cliente en espera*\n\n"
+                f"👤 {conversation.get('customer_name', 'Cliente')}\n"
+                f"📞 {conversation.get('customer_phone', '')}\n"
+                f"💬 \"{request.values.get('Body', '').strip()}\"\n\n"
+                f"Este cliente está esperando que le propongas otras fechas."
+            )
+            response.message(
+                'Gracias por su mensaje. El instalador está revisando su disponibilidad '
+                'y se pondrá en contacto con usted en breve.')
+            return str(response)
+
         if state == ConversationState.PROPOSING_SLOTS:
-            response.message(_format_slots_message(conversation))
+            slots_msg = _format_slots_message(conversation)
+            response.message(slots_msg)
+            conversation['message_log'].append({'from': 'bot', 'text': slots_msg, 'time': datetime.now().strftime('%H:%M')})
             conversation['state'] = ConversationState.WAITING_CHOICE
 
         elif state == ConversationState.WAITING_CHOICE:
@@ -561,10 +594,21 @@ def whatsapp_webhook():
                 conversation['state'] = ConversationState.CONFIRMING
             elif 'no' in incoming_msg or 'ninguna' in incoming_msg:
                 response.message(
-                    'Entendido, no se preocupe. Voy a revisar la agenda para buscarle '
-                    'otras fechas y me pondré en contacto con usted a la mayor brevedad. '
-                    'Gracias por su paciencia.')
-                conversation['state'] = ConversationState.CANCELLED
+                    'Entendido, no se preocupe. Le paso su solicitud al instalador '
+                    'para que le proponga otras fechas. Se pondrá en contacto con usted '
+                    'a la mayor brevedad. Gracias por su paciencia.')
+                conversation['state'] = ConversationState.NEEDS_MANUAL
+                # Notify installer
+                _notify_installer(
+                    f"⚠️ *Cliente necesita otras fechas*\n\n"
+                    f"👤 {conversation.get('customer_name', 'Cliente')}\n"
+                    f"📞 {conversation.get('customer_phone', '')}\n"
+                    f"🔧 {conversation.get('work_type', '')}\n"
+                    f"📍 {conversation.get('location', '')}\n"
+                    f"💬 El cliente ha respondido: \"{request.values.get('Body', '').strip()}\"\n\n"
+                    f"Las fechas propuestas no le venían bien. "
+                    f"Revisa la agenda y contacta al cliente directamente."
+                )
             else:
                 response.message(
                     'Disculpe, no le he entendido. ¿Podría indicarme el número de la '
@@ -604,6 +648,40 @@ def get_appointment_status(conversation_id):
         if conv['id'] == conversation_id:
             return jsonify({'success': True, 'state': conv['state']})
     return jsonify({'success': False, 'error': 'Conversation not found'}), 404
+
+
+@app.route('/conversations', methods=['GET'])
+def list_conversations():
+    """List all active conversations for the installer to monitor."""
+    result = []
+    for phone, conv in conversations.items():
+        result.append({
+            'conversation_id': conv.get('id'),
+            'customer_name': conv.get('customer_name'),
+            'customer_phone': conv.get('customer_phone'),
+            'work_type': conv.get('work_type'),
+            'location': conv.get('location'),
+            'state': conv.get('state'),
+            'state_label': {
+                'greeting': 'Saludo enviado',
+                'proposing_slots': 'Proponiendo fechas',
+                'waiting_choice': 'Esperando respuesta del cliente',
+                'confirming': 'Esperando confirmación',
+                'completed': '✅ Cita confirmada',
+                'cancelled': '❌ Cancelada',
+                'needs_manual': '⚠️ Necesita intervención manual',
+            }.get(conv.get('state'), conv.get('state')),
+            'selected_slot': conv.get('selected_slot', {}).get('formatted') if conv.get('selected_slot') else None,
+            'created_at': conv.get('created_at'),
+            'messages': conv.get('message_log', []),
+        })
+    # Sort: needs_manual first, then by created_at desc
+    result.sort(key=lambda c: (
+        0 if c['state'] == 'needs_manual' else
+        1 if c['state'] in ('waiting_choice', 'confirming', 'proposing_slots', 'greeting') else 2,
+        c.get('created_at', '') or ''
+    ), reverse=False)
+    return jsonify(result)
 
 
 # ===========================================================================
