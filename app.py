@@ -784,6 +784,17 @@ def initiate_appointment():
         return jsonify({'success': False, 'error': str(e)}), 500
 
 
+def _build_full_address(conversation):
+    """Build a full address string from address + location fields."""
+    address = (conversation.get('address') or '').strip()
+    location = (conversation.get('location') or '').strip()
+    if address and location:
+        if location.lower() in address.lower():
+            return address
+        return f'{address}, {location}'
+    return address or location or ''
+
+
 def _format_slots_message(conversation):
     slots = conversation['time_slots']
     lines = []
@@ -914,15 +925,7 @@ def whatsapp_webhook():
                 _reserve_slots([selected_slot], customer_phone)
 
                 # --- Ask to confirm/correct the address ---
-                address = conversation.get('address') or ''
-                location = conversation.get('location') or ''
-                address_line = address
-                if location and address and location.lower() not in address.lower():
-                    address_line = f'{address} ({location})'
-                elif not address and location:
-                    address_line = location
-                elif not address:
-                    address_line = ''
+                address_line = _build_full_address(conversation)
 
                 if address_line:
                     addr_msg = (
@@ -956,7 +959,7 @@ def whatsapp_webhook():
                     f"👤 {conversation.get('customer_name', 'Cliente')}\n"
                     f"📞 {conversation.get('customer_phone', '')}\n"
                     f"🔧 {conversation.get('work_type', '')}\n"
-                    f"📍 {conversation.get('location', '')}\n"
+                    f"📍 {_build_full_address(conversation)}\n"
                     f"💬 El cliente ha respondido: \"{request.values.get('Body', '').strip()}\"\n\n"
                     f"Las fechas propuestas no le venían bien. "
                     f"Revisa la agenda y contacta al cliente directamente."
@@ -977,7 +980,7 @@ def whatsapp_webhook():
                         f"👤 {conversation.get('customer_name', 'Cliente')}\n"
                         f"📞 {conversation.get('customer_phone', '')}\n"
                         f"🔧 {conversation.get('work_type', '')}\n"
-                        f"📍 {conversation.get('location', '')}\n"
+                        f"📍 {_build_full_address(conversation)}\n"
                         f"💬 \"{raw_msg}\"\n\n"
                         f"El bot no ha podido entender al cliente después de varios intentos. "
                         f"Aténdelo manualmente."
@@ -1022,12 +1025,8 @@ def whatsapp_webhook():
             # Show full confirmation summary
             selected_slot = conversation['selected_slot']
             work_type = conversation.get('work_type') or 'la instalación'
-            address = conversation.get('address') or 'la dirección indicada'
-            location = conversation.get('location') or ''
             duration = conversation.get('duration_hours') or DEFAULT_DURATION_HOURS
-            address_line = address
-            if location and location.lower() not in address.lower():
-                address_line = f'{address} ({location})'
+            address_line = _build_full_address(conversation) or 'la dirección indicada'
 
             confirm_msg = (
                 f'Perfecto. Le confirmo los datos de la cita:\n\n'
@@ -1055,9 +1054,11 @@ def whatsapp_webhook():
                     print(f'Error saving appointment: {e}')
                 # Release reservations
                 _release_slots(customer_phone)
+                full_addr = _build_full_address(conversation)
+                addr_line = f'\n📍 {full_addr}' if full_addr else ''
                 response.message(
                     f"Estupendo. Su cita ha quedado confirmada. ✅\n\n"
-                    f"Le espero el {selected_slot['formatted']}.\n\n"
+                    f"📅 {selected_slot['formatted']}{addr_line}\n\n"
                     f'Si le surgiera cualquier imprevisto, le agradecería que me '
                     f'avisara con antelación.\n\n'
                     f'Muchas gracias por su tiempo. Un saludo.')
@@ -1067,7 +1068,7 @@ def whatsapp_webhook():
                     f"✅ *Cita confirmada*\n\n"
                     f"👤 {conversation.get('customer_name', 'Cliente')}\n"
                     f"📅 {selected_slot['formatted']}\n"
-                    f"📍 {conversation.get('location', '')} - {conversation.get('address', '')}\n"
+                    f"📍 {_build_full_address(conversation)}\n"
                     f"🔧 {work_type}\n"
                     f"📞 {conversation.get('customer_phone', '')}\n\n"
                     f"La cita se ha guardado en tu agenda automáticamente."
@@ -1082,7 +1083,7 @@ def whatsapp_webhook():
                     f"👤 {conversation.get('customer_name', 'Cliente')}\n"
                     f"📞 {conversation.get('customer_phone', '')}\n"
                     f"🔧 {conversation.get('work_type', '')}\n"
-                    f"📍 {conversation.get('location', '')}\n\n"
+                    f"📍 {_build_full_address(conversation)}\n\n"
                     f"El cliente no ha confirmado y quiere hacer cambios."
                 )
                 conversation['state'] = ConversationState.NEEDS_MANUAL
@@ -1097,7 +1098,7 @@ def whatsapp_webhook():
                     f"👤 {conversation.get('customer_name', 'Cliente')}\n"
                     f"📞 {conversation.get('customer_phone', '')}\n"
                     f"🔧 {conversation.get('work_type', '')}\n"
-                    f"📍 {conversation.get('location', '')}\n"
+                    f"📍 {_build_full_address(conversation)}\n"
                     f"💬 \"{raw_msg}\"\n\n"
                     f"El cliente ha escrito esto en la fase de confirmación. "
                     f"Puede ser un imprevisto o una duda. Revísalo."
