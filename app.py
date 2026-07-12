@@ -338,34 +338,30 @@ def _ensure_content_templates():
 
 
 def send_whatsapp_buttons(to_number, body_text, template_key):
-    """Send a WhatsApp message with quick-reply buttons.
-    Sends the detailed text first, then the buttons as a second message.
-    Falls back to plain text only if buttons are not available."""
-    # Always send the detailed text first
-    text_sid = send_whatsapp_message(to_number, body_text)
-
-    # Then try to send buttons as a follow-up
+    """Send a WhatsApp message. Tries quick-reply buttons first;
+    if Content API is not available, sends plain text (which always works)."""
+    # Try buttons via Content API (only if enabled on the Twilio account)
     sids = _ensure_content_templates()
     content_sid = sids.get(template_key)
 
-    if not content_sid:
-        print(f'No content template for {template_key}, text-only sent')
-        return text_sid
+    if content_sid:
+        try:
+            btn_to = to_number
+            if not btn_to.startswith('whatsapp:'):
+                btn_to = f'whatsapp:{btn_to}'
+            sent = client.messages.create(
+                from_=TWILIO_WHATSAPP_NUMBER,
+                to=btn_to,
+                content_sid=content_sid,
+                content_variables=json.dumps({'1': body_text}),
+            )
+            print(f'Buttons ({template_key}) sent OK: {sent.sid}')
+            return sent.sid
+        except Exception as e:
+            print(f'Buttons failed ({template_key}), sending plain text: {e}')
 
-    try:
-        btn_to = to_number
-        if not btn_to.startswith('whatsapp:'):
-            btn_to = f'whatsapp:{btn_to}'
-        sent = client.messages.create(
-            from_=TWILIO_WHATSAPP_NUMBER,
-            to=btn_to,
-            content_sid=content_sid,
-        )
-        print(f'Buttons ({template_key}) sent OK: {sent.sid}')
-        return sent.sid
-    except Exception as e:
-        print(f'Error sending buttons (text already sent): {e}')
-        return text_sid
+    # Fallback: always works — plain text message
+    return send_whatsapp_message(to_number, body_text)
 
 
 # --- Availability logic (uses panel API) ------------------------------------
@@ -792,20 +788,23 @@ def _format_slots_message(conversation):
     slots = conversation['time_slots']
     lines = []
     for i, slot in enumerate(slots):
-        lines.append(f"{i + 1}. {slot['formatted']} (aprox. hasta las {slot['end_time']})")
+        lines.append(f"*{i + 1}.* {slot['formatted']} (aprox. hasta las {slot['end_time']})")
     slots_text = '\n'.join(lines)
 
     if len(slots) == 1:
         return (
             f"Le propongo la siguiente fecha:\n\n"
             f"{slots_text}\n\n"
-            f"¿Le viene bien?"
+            f"Responda *1* si le viene bien o *no* si prefiere otra fecha."
         )
     else:
+        n = len(slots)
+        opts = ', '.join(str(i+1) for i in range(n))
         return (
             f"Estas son las fechas que tengo disponibles:\n\n"
             f"{slots_text}\n\n"
-            f"¿Cuál le viene mejor?"
+            f"Responda con el número de la opción ({opts}).\n"
+            f"Si ninguna le encaja, escriba *no*."
         )
 
 
@@ -930,7 +929,7 @@ def whatsapp_webhook():
                         f"Perfecto, {selected_slot['formatted']}.\n\n"
                         f"La dirección que tengo para la instalación es:\n"
                         f"📍 {address_line}\n\n"
-                        f"¿Es correcta?"
+                        f"\nResponda *sí* o *no*."
                     )
                     _send_and_log(conversation, customer_phone, addr_msg, button_key='address_check')
                     conversation['state'] = ConversationState.CONFIRMING_ADDRESS
@@ -1011,7 +1010,7 @@ def whatsapp_webhook():
                     addr_confirm = (
                         f"Gracias, he actualizado la dirección a:\n"
                         f"📍 {new_address}\n\n"
-                        f"¿Es correcta ahora?"
+                        f"\nResponda *sí* si es correcta o escríbame la dirección correcta."
                     )
                     _send_and_log(conversation, customer_phone, addr_confirm, button_key='address_check')
                     return str(MessagingResponse())
@@ -1036,7 +1035,7 @@ def whatsapp_webhook():
                 f'⏱️ Duración aproximada: {duration} horas\n'
                 f'📍 Dirección: {address_line}\n'
                 f'🔧 Trabajo: {work_type}\n\n'
-                f'¿Todo correcto?'
+                f'\nResponda *sí* para confirmar o *no* si necesita cambiar algo.'
             )
             _send_and_log(conversation, customer_phone, confirm_msg, button_key='confirm_yesno')
             conversation['state'] = ConversationState.CONFIRMING
